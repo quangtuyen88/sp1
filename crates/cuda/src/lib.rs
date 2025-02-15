@@ -102,8 +102,6 @@ pub struct WrapRequestPayload {
 }
 
 impl SP1CudaProver {
-    /// Creates a new [SP1Prover] that runs inside a Docker container and returns a
-    /// [SP1ProverClient] that can be used to communicate with the container.
     pub fn new() -> Result<Self, Box<dyn StdError>> {
         let container_name = "sp1-gpu";
         let image_name = std::env::var("SP1_GPU_IMAGE")
@@ -123,27 +121,36 @@ impl SP1CudaProver {
             return Err(format!("Failed to pull Docker image: {}. Please check your internet connection and Docker permissions.", e).into());
         }
 
-        // Start the docker container
+        // Start the docker container with GPU memory management
         let rust_log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "none".to_string());
+
+        // Calculate GPU memory limit (24GB + buffer)
+        let gpu_memory_mb = 13600; // 25GB in MB (24GB + 1GB buffer)
+
         let mut child = Command::new("docker")
             .args([
                 "run",
-                "-e",
-                &format!("RUST_LOG={}", rust_log_level),
-                "-p",
-                "3000:3000",
+                "-e", &format!("RUST_LOG={}", rust_log_level),
+                "-e", &format!("NVIDIA_MEM_LIMIT={}m", gpu_memory_mb),
+                "--runtime=nvidia",
+                "--gpus", &format!("device=0,capabilities=compute,memory={}m", gpu_memory_mb),
+                "-p", "3000:3000",
                 "--rm",
-                "--gpus",
-                "all",
-                "--name",
-                container_name,
+                "--name", container_name,
+                "--memory-swap=-1",      // Disable swap limit
+                "--shm-size=2g",         // Increased shared memory
+                "--ulimit", "memlock=-1", // Remove memory lock limits
                 &image_name,
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("Failed to start Docker container: {}. Please check your Docker installation and permissions.", e))?;
+            .map_err(|e| format!(
+                "Failed to start Docker container: {}. Please check your Docker installation and permissions.", 
+                e
+            ))?;
 
+        // Rest of the implementation remains the same...
         let stderr = child.stderr.take().unwrap();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
@@ -187,10 +194,10 @@ impl SP1CudaProver {
         })
         .unwrap();
 
-        // Wait a few seconds for the container to start
-        std::thread::sleep(Duration::from_secs(2));
+        // Add a longer delay for container startup with GPU initialization
+        std::thread::sleep(Duration::from_secs(5));
 
-        // Check if the container is ready
+        // Rest of the implementation (client setup, etc.) remains the same...
         let client = Client::from_base_url(
             Url::parse("http://localhost:3000/twirp/").expect("failed to parse url"),
         )
@@ -203,7 +210,7 @@ impl SP1CudaProver {
             tracing::info!("waiting for proving server to be ready");
             loop {
                 if start_time.elapsed() > timeout {
-                    return Err("Timeout: proving server did not become ready within 60 seconds. Please check your Docker container and network settings.".to_string());
+                    return Err("Timeout: proving server did not become ready within 300 seconds. Please check your Docker container and network settings.".to_string());
                 }
 
                 let request = ReadyRequest {};

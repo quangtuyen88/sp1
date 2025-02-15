@@ -105,7 +105,7 @@ impl SP1CudaProver {
     pub fn new() -> Result<Self, Box<dyn StdError>> {
         let container_name = "sp1-gpu";
         let image_name = std::env::var("SP1_GPU_IMAGE")
-            .unwrap_or_else(|_| "public.ecr.aws/succinct-labs/moongate:v4.1.0".to_string());
+            .unwrap_or_else(|_| "public.ecr.aws/succinct-labs/moongate:v4.0.0".to_string());
 
         let cleaned_up = Arc::new(AtomicBool::new(false));
         let cleanup_name = container_name;
@@ -253,13 +253,102 @@ impl SP1CudaProver {
     }
 
     /// Executes the [sp1_prover::SP1Prover::setup] method inside the container.
-    pub fn setup(&self, elf: &[u8]) -> Result<(SP1ProvingKey, SP1VerifyingKey), Box<dyn StdError>> {
+     pub fn setup(&self, elf: &[u8]) -> Result<(SP1ProvingKey, SP1VerifyingKey), Box<dyn StdError>> {
+        tracing::debug!("Starting setup with ELF size: {} bytes", elf.len());
+
         let payload = SetupRequestPayload { elf: elf.to_vec() };
-        let request =
-            crate::proto::api::SetupRequest { data: bincode::serialize(&payload).unwrap() };
-        let response = block_on(async { self.client.setup(request).await }).unwrap();
-        let payload: SetupResponsePayload = bincode::deserialize(&response.result).unwrap();
-        Ok((payload.pk, payload.vk))
+        let serialized_payload = bincode::serialize(&payload)
+            .map_err(|e| format!("Failed to serialize setup payload: {}", e))?;
+
+        let request = crate::proto::api::SetupRequest { 
+            data: serialized_payload 
+        };
+
+        let max_retries = 3;
+        let mut attempt = 0;
+        let mut last_error = None;
+
+        while attempt < max_retries {
+            tracing::debug!("Setup attempt {} of {}", attempt + 1, max_retries);
+            
+            if let Err(e) = self.verify_container_health() {
+                return Err(format!("Container health check failed: {}", e).into());
+            }
+
+            match block_on(async { 
+                let timeout = Duration::from_secs(60);
+                tokio::time::timeout(timeout, self.client.setup(request.clone())).await
+            }) {
+                Ok(Ok(response)) => {
+                    tracing::debug!("Setup request successful");
+                    match bincode::deserialize(&response.result) {
+                        Ok(payload) => {
+                            let payload: SetupResponsePayload = payload;
+                            tracing::debug!("Setup completed successfully");
+                            return Ok((payload.pk, payload.vk));
+                        }
+                        Err(e) => {
+                            return Err(format!("Failed to deserialize setup response: {}", e).into());
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Setup attempt {} failed: {}", attempt + 1, e);
+                    last_error = Some(e);
+                }
+                Err(_) => {
+                    tracing::warn!("Setup attempt {} timed out", attempt + 1);
+                }
+            }
+
+            attempt += 1;
+            if attempt < max_retries {
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        }
+
+        let logs = Command::new("docker")
+            .args(["logs", &self.container_name])
+            .output()
+            .map_err(|e| format!("Failed to get container logs: {}", e))?;
+
+        Err(format!(
+            "Setup failed after {} attempts. Last error: {:?}\nContainer logs:\n{}",
+            max_retries,
+            last_error,
+            String::from_utf8_lossy(&logs.stdout)
+        ).into())
+    }
+
+    fn verify_container_health(&self) -> Result<(), Box<dyn StdError>> {
+        let status = Command::new("docker")
+            .args(["inspect", &self.container_name, "--format={{.State.Status}}"])
+            .output()
+            .map_err(|e| format!("Failed to inspect container: {}", e))?;
+
+        let status_str = String::from_utf8_lossy(&status.stdout).trim().to_string();
+
+        if status_str != "running" {
+            let logs = Command::new("docker")
+                .args(["logs", &self.container_name])
+                .output()
+                .map_err(|e| format!("Failed to get container logs: {}", e))?;
+
+            return Err(format!(
+                "Container is not running (status: {}). Logs:\n{}",
+                status_str,
+                String::from_utf8_lossy(&logs.stdout)
+            ).into());
+        }
+
+        match block_on(async {
+            let request = ReadyRequest {};
+            self.client.ready(request).await
+        }) {
+            Ok(response) if response.ready => Ok(()),
+            Ok(_) => Err("Service is not ready".into()),
+            Err(e) => Err(format!("Failed to check service readiness: {}", e).into()),
+        }
     }
 
     /// Executes the [sp1_prover::SP1Prover::prove_core] method inside the container.
